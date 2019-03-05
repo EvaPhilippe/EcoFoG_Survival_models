@@ -1,0 +1,192 @@
+---
+title: "Modèle de survie"
+author: "Eva Philippe"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+pdftoc: no
+preamble: >
+  \usepackage{textcomp}
+  \DeclareUnicodeCharacter{B0}{\textdegree}
+  \hyphenation{bio-di-ver-si-ty sap-lings}
+lang: french # english
+always_allow_html: yes
+output:
+  bookdown::html_document2:
+    theme: sandstone
+    toc: yes
+    toc_float: yes
+  bookdown::gitbook:
+    config:
+      download: null
+  bookdown::word_document2: default
+  bookdown::pdf_book:
+    base_format: EcoFoG::memo
+    keep_tex: yes
+---
+
+
+```{r setup, include=FALSE}
+rm(list = ls()) #pour vider l'environnement
+invisible(gc()) #activer le garbage collector
+set.seed(42) #alea reproductible
+library(knitr)
+library(tidyverse)
+library(rstan)
+library(bayesplot)
+library(kableExtra)
+library(xlsx)
+library(FactoMineR)
+theme_set(bayesplot::theme_default()) 
+opts_chunk$set(
+  echo = F, message = F, warning = F, fig.height = 6, fig.width = 6,
+  cache = T, cache.lazy = F)
+options(mc.cores = parallel::detectCores()-1) #utiliser le nombre max de cores à chaque fit
+rstan_options(auto_write = T) #compiler que la première fois
+load("./Rdata/data.Rdata") #charger mes données
+source("./Fonctions/preparation_donnees_stan.R") #charger mes fonctions
+Dates_inv<-dates$annee
+```
+
+
+# Présentation du modèle
+
+On cherche à modéliser la fonction de survie des jeunes arbres en forêt tropicale humide. On dispose des données d'inventaires effectués à Paracou (1992, 1993, 1995, 2002, 2005, 2008, 2013, 2016) sur 25 espèces de juvéniles (recrutés à partir de 1,30m de hauteur et moins de 10cm de diamètre la première année). Les données disponibles sur ces individus sont de natures diverses et n'ont pas toutes été mesurées aux mêmes dates.
+
+
+
+## Fonction de survie
+
+On notera :
+
+* $T$ la variable aléatoire modélisant la date de mort d'un individu (qui prend en compte sa date de recrutement $t_r$ et son temps de survie)
+* $f$ la fonction de densité associée ("$f(t) = P(T=t |T \geq t_r)$")
+* $S$ la fonction de survie : pour $t\geq t_r$, $S(t) = P(T\geq t| T\geq t_r)=1-\int_{t_r}^t f(s)ds$
+* $h$ la fonction de hasard (ou de risque) instantanné $h(t)=P(T = t | T\geq t)$.
+
+Ces fonctions s'expriment les unes en fonction des autres car $h(t)=\lim_{h \rightarrow 0}\frac{P(t\leq T\leq t+h | T\geq t)}{h}=-\frac{S'(t)}{S(t)}=\frac{f(t)}{S(t)}$.
+
+La fonction de densité du temps de survie après recrutement en $t_r$ s'exprime $f(t)= h(t)\exp\int_{t_r}^t h(s)ds$.
+
+Dans le cas le plus simple où on regarde un taux de mortalité constant $\lambda$ (processus sans mémoire), la fonction de densité de $T$ est une exponentielle décroissante : $f(t)=\lambda \exp(-\lambda (t-t_r))$. C'est également le profil qu'aura l'évolution d'une population sans recrutement dont tous les individus ont ce même taux de mortalité instantanné. L'espérance du temps de survie est égale à $\frac{1}{\lambda}$.
+
+
+
+Dans notre cas, on ne peut observer la mort d'un individu que lors d'un inventaire, on peut donc seulement dire qu'un individu est mort entre deux dates d'inventaires $t_{k-1}$ et $t_{k}$.
+
+La fonction discrète qui pour un individu et un inventaire associe la probabilité que l'individu soit déclaré mort à cet intervalle est 
+\begin{equation}
+F(t_k):= P(T \in ]t_{k-1}, t_k])=\int_{t_{k-1}}^{t_k} f(t)dt.
+(\#eq:F)
+\end{equation}
+
+## Choix d'un hasard dépendant des covariables, mis à jour chaque année
+
+J'ai choisi de considérer une fonction de hasard constante par morceaux qui dépend des covariables et qu'on met à jour chaque année (car c'est l'échelle la plus fine sur laquelle on a des mesures, précédemment je mettais à jour le hasard uniquement lors des années d'inventaires, sur les covariables pour lesquelles je pouvais tester les deux modèles, celui plus précis donnait une meilleure vraisemblance) : pour $t\in [j, j+1[$, on prendra $h(t)=\lambda_i(j)=\lambda(X_i(j))$, où $X_i(j)$ est le vecteur de covariables de l'individu $i$ à l'année $j$.
+
+On va calculer pour chaque individu $i$ son vecteur de covariables à chaque année entre 1992 et 2016 en prenant l'interpolation linéaire entre les deux dates de mesure disponibles (l'interpolation linéaire traduirait une probabilité uniforme sur le changement entre les deux années de mesure).
+
+En développant l'expression \@ref(eq:F) on obtient:
+$$F_i(t_k)=\exp \Big(-\sum_{j=t_r}^{t_{k-1}-1} \lambda_i(j)\Big) \Big(1-\exp\big(-\sum_{t_{k-1}}^{t_k-1} \lambda_i(j) \big)\Big).$$
+
+Si $k$ correspond à l'inventaire où l'individu $i$ a effectivement été observé mort, cela correspond à la contribution de cet individu $i$ à la vraisemblance.
+
+Si l'individu est censuré à droite (on a arrêté les inventaires avant d'observer sa mort, ou il a dépassé 10cm de DBH avant de mourir) et que $k$ est le dernier inventaire où il a été observé, on prendra
+$$1-\sum_{j=r+1}^k F_i(t_k).$$
+
+
+En général on prendra $\lambda(X_i(j)) = \exp(\beta * X_i(j))$, où $\beta$ est le vecteur-ligne correspondant aux coefficients devant les covariables, $\beta[1]$ étant l'intercept (on prendra toujours $X(t)[1]=1$). On utilisera des covariables centrées-réduites (en prenant la moyenne et l'écart-type sur les moyennes par individu) pour pouvoir comparer les coefficients.
+
+Le choix d'un tel $\lambda$ peut être à discuter selon les covariables étudiées. Il faut notamment vérifier a posteriori avec le coefficient estimé que l'on reste dans un régime linéaire et qu'on ne donne pas un poids démesuré à des valeurs positives ou négatives comme on peut le craindre avec un profil exponentiel.
+
+Code Stan correspondant :
+
+```{stan output.var="Modele_script_gen2", eval=F, echo=T}
+functions{
+  real log_F(
+    int r, //recrutement
+    int k, //date pour laquelle on calcule 
+    int[] dates, //vecteur des dates d'inventaires, en commençant à 1 et pas 1992
+    row_vector beta, //vecteur des paramètres
+    vector[] x){ //vecteur des covariables par année pour un individu
+    real ret ;
+    real ret2 ;
+    ret=0 ;
+    for (j in dates[r]:(dates[k-1]-1)){
+      ret-=exp(beta*x[j]) ;
+    }
+    ret2=0 ;
+    for (j in dates[k-1]:(dates[k]-1)){
+      ret2-=exp(beta*x[j]) ;
+    }
+    ret+=log_diff_exp(0, ret2) ;
+    return ret ;
+  }
+  real log_likelihood(
+    int r, //recrutement
+    int m, //mort 
+    int[] dates, //vecteur des dates d'inventaire
+    row_vector beta, //vecteur des paramètres
+    vector[] x, //vecteur des covariables par année
+    int cens //indicatrice de censure
+    ){
+      if (cens==0){
+        return log_F(r, m, dates, beta, x);
+      }
+      else{
+        real ret ;
+        ret=1 ;
+        for (k in (r+1):m){
+          ret-=exp(log_F(r, k, dates, beta, x)) ; 
+      return log(ret) ;
+      }
+    }
+}
+
+
+data {
+  int<lower=1> D ; // nombre d'inventaires
+  int Dates[D] ; // Dates[j] correspond à la date de l'inventaire j, en commençant à 1 et pas 1992
+  int<lower=1> I ; //nombre d'individus
+  int<lower=0> P; //nombre de covariables+1
+  int<lower=1> L; //nombre total d'années sur la période étudiée
+  vector[P] X[I,L] ; // array des covariables par individu et par année, X[i,j, c] correspond à la covariable c de l'individu i à l'inventaire j
+  int Recr[I] ; //Recr[i] correspond à l'indice de l'inventaire de recrutement de l'individu i
+  int Mort[I] ; //Mort[i] correspond soit à l'inventaire auquel l'individu i est observé mort, soit au dernier inventaire auquel il a été vu vivant, s'il est censuré à droite
+  int Cens[I] ; //Cens[i]=1 si l'individu est censuré (sa mort n'est pas observée), 0 sinon
+}
+
+
+parameters{
+  row_vector[P] Beta ; //vecteur des paramètres, Beta[1] est l'intercept
+}
+
+
+model{
+  for (i in 1:I){
+    target+= log_likelihood(
+      Recr[i], 
+      Mort[i], 
+      Dates,
+      Beta,
+      X[i],
+      Cens[i]) ;
+  }
+}
+```
+
+En version finale on prendra une version modifiée de ce modèle, pour pouvoir mettre des priors précis sur chaque paramètre. Comme priors on prendra les valeurs précédemment estimées.
+
+## Interprétation des paramètres
+
+Ce modèle permet de comparer facilement le poids des différentes covariables entre elles.
+
+Imaginons deux individus $1$ et $2$ dont la seule covariable différente est X[c].
+
+On a alors :
+$$\frac{\lambda_1}{\lambda2}=\exp\Big(\beta_c*(X_1[c]-X_2[c])\Big).$$
+
+Si $\beta_c > 0$, $\lambda$ augmente lorsque $X[c]$ augmente et si $\beta_c <0$, $\lambda$ diminue lorsque $X[c]$ augmente. L'effet de la covariable $X[c]$ est d'autant plus important que $|\beta_c|$ est grand.
+
+Si on a des covariables d'échelle comparable (par exemple si elles sont centrées-réduites), on peut regarder l'effet d'ajouter une unité à une covariable $c$ : cela multiplie le hasard instantanné par $r_c=\exp(\beta_c)$. On peut alors comparer les variables entre elles en disant que la variable $c_1$ a un effet $\frac{r_{c_1}}{r_{c_2}}$ fois plus important que la variable $c_2$.
+
+
+
