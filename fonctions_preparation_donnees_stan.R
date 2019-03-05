@@ -1,4 +1,3 @@
-#### Fonctions utilisées dans stan_covar.Rmd
 
 ## fun_data --------------
 
